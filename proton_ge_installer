@@ -1,0 +1,127 @@
+#!/bin/bash
+# Script for automatically installing new Proton-GE version
+# Requirements: jq
+
+# CONFIGURE
+STEAM_COMPAT_DIR="${STEAM_COMPAT_DIR:-$HOME/.local/share/Steam/compatibilitytools.d/}" # Set this
+GITHUB_API_URL="https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases"
+
+list_versions() {
+    local per_page=${1:-10}
+    local page=${2:-1}
+    curl -s "$GITHUB_API_URL?per_page=$per_page&page=$page" | \
+        grep '"tag_name":' | cut -d '"' -f4
+}
+
+select_version() {
+    local per_page=10
+    local page=1
+    while true; do
+        echo "Fetching available Proton-GE versions (page $page)..."
+        mapfile -t versions < <(list_versions $per_page $page)
+        if [ ${#versions[@]} -eq 0 ]; then
+            echo "No more versions found."
+            if (( page > 1 )); then
+                ((page--))
+            else
+                return 1
+            fi
+            continue
+        fi
+        echo "Available versions:"
+        for i in "${!versions[@]}"; do
+            printf "  %2d) %s\n" "$((i+1))" "${versions[$i]}"
+        done
+        echo "  n) More versions (next page)"
+        if (( page > 1 )); then
+            echo "  b) Back (previous page)"
+        fi
+        echo "  q) Quit"
+        read -p "Select a version to install [1-${#versions[@]}], n for next, b for back, q to quit: " choice
+        if [[ "$choice" =~ ^[1-9][0-9]*$ ]] && ((choice >= 1 && choice <= ${#versions[@]})); then
+            SELECTED_VERSION="${versions[$((choice-1))]}"
+            return 0
+        elif [[ "$choice" == "n" ]]; then
+            ((page++))
+        elif [[ "$choice" == "b" ]] && (( page > 1 )); then
+            ((page--))
+        elif [[ "$choice" == "q" ]]; then
+            exit 0
+        else
+            echo "Invalid choice, please try again."
+        fi
+    done
+}
+
+main() {
+    set -euo pipefail
+
+    DOWNLOAD_DIR=$(mktemp -d /tmp/proton-ge-custom-XXXXXXXX)
+    cd "$DOWNLOAD_DIR" || { echo "Failed to cd to $DOWNLOAD_DIR"; exit 1; }
+
+    trap '
+        if [[ -d "$DOWNLOAD_DIR" && "$DOWNLOAD_DIR" != "/" && -n "$DOWNLOAD_DIR" ]]; then
+            rm -rf -- "$DOWNLOAD_DIR"
+        else
+            echo "Failed cleanup, potentially dangerous directory: $DOWNLOAD_DIR" >&2
+        fi
+    ' EXIT
+
+
+    if ! select_version; then
+        echo "No version selected. Exiting."
+        exit 1
+    fi
+    echo "Selected version: $SELECTED_VERSION"
+
+    echo "Fetching release info..."
+    tarball_url=$(curl -s "$GITHUB_API_URL" | \
+        jq -r --arg tag "$SELECTED_VERSION" '.[] | select(.tag_name==$tag) | .assets[] | select(.name | endswith(".tar.gz")) | .browser_download_url')
+    checksum_url=$(curl -s "$GITHUB_API_URL" | \
+        jq -r --arg tag "$SELECTED_VERSION" '.[] | select(.tag_name==$tag) | .assets[] | select(.name | endswith(".sha512sum")) | .browser_download_url')
+
+    tarball_name=$(basename "$tarball_url")
+    checksum_name=$(basename "$checksum_url")
+
+    echo "Downloading tarball: $tarball_name..."
+    curl -# -L "$tarball_url" -o "$tarball_name" --no-progress-meter
+
+    echo "Downloading checksum: $checksum_name..."
+    curl -# -L "$checksum_url" -o "$checksum_name" --no-progress-meter
+
+    echo "Verifying tarball $tarball_name with checksum $checksum_name..."
+    sha512sum -c "$checksum_name"
+    if [ $? -ne 0 ]; then
+        echo "Checksum verification failed! Exiting."
+        exit 1
+    fi
+
+    echo "Creating Steam compatibilitytools.d directory if it does not exist..."
+    mkdir -p "$STEAM_COMPAT_DIR"
+
+    echo "Extracting $tarball_name to Steam directory..."
+    tar -xf "$tarball_name" -C "$STEAM_COMPAT_DIR"
+
+    read -p "Do you want to restart Steam now? [y/N]: " answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        echo "Restarting Steam..."
+        #pkill steam
+        steam -shutdown
+        timeout=5
+        elapsed=0
+        while pgrep -x steam >/dev/null; do
+            if (( elapsed >= timeout )); then
+                echo "Timeout waiting for Steam to close."
+                break
+            fi
+            sleep 1
+            ((elapsed++))
+        done
+        nohup steam &>/dev/null &
+    else
+        echo "Steam will not be restarted."
+    fi
+    echo "All done :)"
+}
+
+main
